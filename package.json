@@ -5,7 +5,7 @@
   "type": "module",
   "description": "A source-backed Texas teaching career navigator",
   "engines": {
-    "node": ">=22.12.0"
+    "node": ">=22.12.0 <27"
   },
   "scripts": {
     "dev": "concurrently -k -n api,web \"node --watch server/index.js\" \"vite --host 127.0.0.1\"",

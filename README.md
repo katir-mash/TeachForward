@@ -8,7 +8,7 @@ The app is a navigator. TEA and approved educator preparation programs determine
 
 ## Start on Windows
 
-Install Node.js **22.12 or newer**. After cloning the repository, open PowerShell in its root folder, alongside `package.json`. Use `npm.cmd`, because Windows may block `npm.ps1`.
+Use the repository's pinned Node.js version, **26.13.1**, or a supported version in the `package.json` range (`>=22.12 <27`). After cloning the repository, open PowerShell in its root folder, alongside `package.json`. Use `npm.cmd`, because Windows may block `npm.ps1`.
 
 ```powershell
 npm.cmd ci
@@ -35,10 +35,12 @@ If a port is already in use, stop the other TeachForward process before starting
 | Full basic Texas roadmap and official sources | Everything in Free |
 | Saved task progress and next action | Personalized weekly practice plan |
 | One subject practice task in the roadmap | Additional practice exercises and note fields |
-| Up to 3 successful Mentor questions per UTC day, when connected | Up to 20 successful Mentor questions per UTC day, when connected |
+| Up to 3 Mentor questions per browser per UTC day, when connected | Up to 20 Mentor questions per browser per UTC day, when connected |
 | | Downloadable JSON progress summary |
 
 **$9.99/month is a proposed price being tested.** There is no payment integration or automatic subscription. The Node API checks Plus access using an anonymous signed browser cookie. The administrator can grant access for a limited number of days or enable the clearly labeled public demo.
+
+Network and service-wide daily AI limits can stop requests before a browser's own allowance is exhausted. These limits and daily browser usage are saved to disk before contacting OpenAI, so restarting the server does not reset them.
 
 ## Administrator and manual Plus access
 
@@ -77,13 +79,17 @@ PORT=3001
 OPENAI_MAX_RETRIES=1
 ```
 
+When `OPENAI_API_KEY` or `ADMIN_PASSWORD_HASH` is configured, a stable private `SESSION_SECRET` of at least 32 characters is required even in development. Run `npm.cmd run setup:admin` once to generate a missing secret without printing it, or set a private random value locally in `server/.env`. Preserve an existing valid secret. Development without AI or administrator configuration still works without one.
+
 Do not paste a key into chat, commit it, or put it into a `VITE_` variable. The browser never loads `server/.env`; `server/index.js` loads this exact server-side file using `dotenv`. `OPENAI_MODEL` is a server setting. The documented default, [GPT-6 Luna](https://developers.openai.com/api/docs/models/gpt-6-luna), supports text output and the Responses API. Its published standard text rates checked on November 14, 2026 are $0.10 per million input tokens and $0.50 per million output tokens. The configuration used in the dated local verification completed one successful live request; new keys, models and deployments require a separate check. The default uses `reasoning.effort: none`; changing the model requires checking that model's access and supported parameters. Restart the development command after changing environment configuration.
 
-The official OpenAI Node SDK is called only in `server/app.js`, using the Responses API. Requests include the real question and server-generated context, rather than a fabricated fallback. The server enforces a 1,200-character question limit, a 16 KB JSON body limit, a per-IP limit of 10 Mentor attempts per minute, per-session daily allowances and one in-flight request per session. Answers are capped at 650 output tokens and 4,000 characters. The API has a 20-second total deadline, including at most one SDK retry for transient errors; `OPENAI_MAX_RETRIES` accepts only `0` or `1`. The frontend has a 25-second timeout. Failed, incomplete or oversized provider responses do not consume the local daily allowance.
+The official OpenAI Node SDK is called only in `server/app.js`, using the Responses API. Requests include the real question and server-generated context, rather than a fabricated fallback. The server enforces a 1,200-character question limit, a 16 KB JSON body limit, a per-IP limit of 10 Mentor attempts per minute and one in-flight request per browser session. Answers are capped at 650 output tokens and 4,000 characters. The API has a 20-second total deadline, including at most one SDK retry for transient errors; `OPENAI_MAX_RETRIES` accepts only `0` or `1`. The frontend has a 25-second timeout.
+
+`server/data/usage.json` records browser allowances and daily provider-attempt reservations. Before an AI request, the server reserves one browser question and `1 + OPENAI_MAX_RETRIES` possible provider attempts. Defaults allow **100 provider-attempt slots per service per UTC day** and **30 per network per UTC day**, configurable with `AI_DAILY_REQUEST_LIMIT` and `AI_IP_DAILY_REQUEST_LIMIT`. Reserved network/service slots are never refunded, including on errors, unused retries or restart. Failed, incomplete or oversized responses refund the browser question only after that refund is saved. An interrupted reservation remains counted conservatively. These are request limits, not a guaranteed dollar spending cap.
 
 The server retains at most three successful question/answer exchanges and 6,000 characters for the current anonymous conversation. It discards oldest complete exchanges to meet both bounds. A new conversation ID or any changed profile answer starts fresh history. The browser does not supply authoritative assistant history, certification facts or source links. Profile, roadmap and progress context are regenerated for every question; the verified dataset takes precedence over earlier chat text. Model-generated URLs are removed, and the interface displays only the reviewed server source links.
 
-Missing configuration returns **503**. Provider errors return a generic **502**, and timeouts return **504**, without exposing the key or provider internals. Invalid inputs, quota limits and server connection problems have visible error states.
+Missing configuration or unavailable quota storage returns **503**. Provider errors return a generic **502**, and timeouts return **504**, without exposing the key or provider internals. Quota exhaustion returns **429** with a retry time. If quota state cannot be saved, the server does not start a provider request. Invalid inputs, limits and server connection problems have visible error states.
 
 The recorded live check used one short real Mentor request through the interface with `OPENAI_MAX_RETRIES=0` and a guard against a second provider attempt. No second paid request was made. For a new setup, add your key locally, restart the server and make a short Mentor request when ready to use the paid API. Automated tests do not perform that check. A health check alone does not prove provider access.
 
@@ -97,23 +103,27 @@ From the project folder:
 npm.cmd ci
 npm.cmd test
 npm.cmd run build
+npm.cmd run setup:admin
+$env:APP_ORIGIN = "http://localhost:3001"
 npm.cmd start
 ```
 
-Open **http://localhost:3001**. The production command enables production mode and serves both the built React app and `/api` from one Node process. `dist` must exist before starting it. The server reads the host-provided `PORT`, with 3001 as its local default.
+For this local preview, open **http://localhost:3001**. `setup:admin` preserves an existing configuration and supplies a stable local signing secret when missing; the PowerShell assignment sets the explicit local origin for this process. If using a different `PORT`, match it in `APP_ORIGIN`. Production startup always requires an explicit valid origin and a `SESSION_SECRET` of at least 32 characters, even for a local preview. Local `server/data` files do not establish public-host durability. The production command serves the built React app and `/api` from one Node process; `dist` must exist first. The server reads the host-provided `PORT`, with 3001 as its local default, and binds to `0.0.0.0`.
+
+For a public deployment, follow [the Render deployment guide](docs/render.md). It keeps this single-server architecture and requires actual persistent disk storage. No host, disk or paid plan has been connected by this repository.
 
 To deploy to a Node web service or your own Node host:
 
 1. Upload or connect the source repository, including `package-lock.json`, `server`, `shared`, `src`, `public` and `index.html`. Exclude `.env`, `server/admin-access.txt`, `server/data/`, `node_modules`, test output and local secrets.
 2. Set the build command to `npm ci --include=dev && npm run build`, and the start command to `npm start`. On a Windows host, use `npm.cmd` in those commands. The explicit `--include=dev` keeps Vite available during the build even when the host sets `NODE_ENV=production`.
-3. Set `NODE_ENV=production` and `APP_ORIGIN` to the exact public HTTPS origin, for example `https://your-teachforward-domain.example`, without a trailing slash. The host usually supplies `PORT`.
-4. Set a stable server-only `SESSION_SECRET` and `ADMIN_PASSWORD_HASH` in the host’s secret/environment settings. The administrator hash is generated by `npm.cmd run setup:admin`; the password stays private. To enable AI, set `OPENAI_API_KEY`, `OPENAI_MODEL=gpt-6-luna` (or another verified model available to that key), and `OPENAI_MAX_RETRIES=1` there. Do not upload your local `.env`, credential file, or put these settings into frontend build variables. Restart or redeploy the Node service after changing them; local settings do not configure the host.
+3. Set `NODE_ENV=production` and `APP_ORIGIN` to the exact public HTTPS origin, for example `https://your-teachforward-domain.example`, without credentials, path, query or fragment. Loopback HTTP origins are allowed only for local production previews/tests. Render requires the public HTTPS configuration. The host supplies `PORT`.
+4. Set a stable server-only `SESSION_SECRET` of at least 32 characters and `ADMIN_PASSWORD_HASH` in the host’s secret/environment settings. The administrator hash is generated by `npm.cmd run setup:admin`; the password stays private. To enable AI, set `OPENAI_API_KEY`, `OPENAI_MODEL=gpt-6-luna` (or another verified model available to that key), and `OPENAI_MAX_RETRIES=1` there. Do not upload your local `.env`, credential file, or put these settings into frontend build variables. Restart or redeploy the Node service after changing them; local settings do not configure the host.
 5. Set `TRUST_PROXY=1` only if the deployment is behind exactly one known trusted reverse proxy and the host’s forwarding setup requires it. Otherwise leave it unset. This affects client IP limiting and HTTPS handling.
 6. Keep `/api` on the same origin as the frontend, use HTTPS, and configure the host’s health check to **`/api/health`**. It returns readiness and AI configuration status without secrets.
-7. Mount a persistent writable volume at the project's `server/data` directory. `ACCESS_DATA_FILE` can select another JSON path **inside the project**; paths outside the project are rejected. Keep a private backup of that data and the stable signing secret. Without persistent storage, manual grants and the demo setting can be lost on redeploy.
+7. Mount a persistent writable volume inside the project and set `DATA_DIRECTORY` to that absolute directory. Set `PERSISTENT_STORAGE_CONFIRMED=1` only after verifying the physical disk is attached; this flag acknowledges the setup and does not make an ordinary directory persistent. `access.json` and `usage.json` default to that directory. Optional `ACCESS_DATA_FILE` and `USAGE_DATA_FILE` overrides must remain inside it. Public startup rejects missing storage acknowledgement or out-of-directory paths. Back up both files and the stable signing secret; a normal local JSON file is not durable on an ephemeral host.
 8. After deployment, create a roadmap, refresh after checking a task, sign into `/admin`, grant and revoke access for its Access ID, test the demo setting, and verify the AI available/unavailable state. No publication or paid host has been configured by this project.
 
-The deployment is a single-process MVP. Manual Plus expiry dates, browser-identity digests and the public demo setting persist in the JSON access store. Browser identity uses a signed HttpOnly, SameSite=Lax cookie lasting up to 365 days, renewed on API session use; retaining that cookie, the signing secret and the data file is necessary to preserve access. Clearing cookies, changing browser or losing the secret breaks that link, with no account-based recovery. Demo status, chat and usage counters remain in memory, expire after seven days, may be evicted at capacity and reset on server restart. Administrator login sessions last up to eight hours and also reset on restart. Multiple server instances do not share these sessions or coordinate JSON writes. Manual access does not process payments; real billing and durable shared quotas require a separate implementation.
+The deployment is a single-process MVP. The JSON stores persist manual Plus expiry dates, browser-identity digests, the public demo setting, browser-creation counters, daily AI allowances and provider-attempt reservations. Browser identity uses a signed HttpOnly, SameSite=Lax cookie lasting up to 365 days, renewed on API session use; retaining that cookie, signing secret and access record is necessary to preserve access. Inactive records are eligible for cleanup after 30 days; active manual grants are protected, with retention measured from the later of last seen or recorded grant expiry. Clearing cookies, changing browser or losing the secret breaks the link, with no account-based recovery. Demo status and chat remain in seven-day memory sessions; administrator logins last up to eight hours. These temporary sessions reset on restart. Multiple instances do not share them or coordinate JSON writes. Manual access does not process payments; real billing requires separate implementation.
 
 ## Data and privacy
 
@@ -122,7 +132,7 @@ The deployment is a single-process MVP. Manual Plus expiry dates, browser-identi
 - The downloaded JSON contains profile choices, task completion, the weekly plan and source references. It is a personal progress summary, not an official document.
 - Sending a Mentor question sends that question, four profile choices, the generated route, task completion, official source context, and up to three recent successful exchanges to the Node server and then OpenAI. Exercise notes are not sent. The history is stored only in the server's bounded anonymous session memory, up to 6,000 characters, and resets on a new conversation ID, changed profile, cookie loss or server restart. Leaving the roadmap or refreshing creates a new browser conversation ID; earlier history is not reused for that new conversation. Chat is not saved to localStorage.
 - The API requests `store: false`. This is not a promise of zero provider retention; OpenAI’s account terms and data policies still apply. Do not include sensitive personal information in questions.
-- Visitors have no registration or sign-in. The separate administrator page has password authentication and can view Access IDs, access dates, plan status and usage counts, but not profile answers, chat content or API secrets. Access metadata is stored in a local JSON file; no database service, analytics, payment processor or email service is connected.
+- Visitors have no registration or sign-in. The separate administrator page has password authentication and can view Access IDs, access dates, plan status and usage counts, but not profile answers, chat content or API secrets. JSON stores contain access metadata, identity/network digests and quota/admission counters; no raw IP, profile or chat content is stored there. No database service, analytics, payment processor or email service is connected.
 
 ## Official requirements and source updates
 
@@ -140,7 +150,7 @@ npm.cmd run build
 npm.cmd run test:e2e
 ```
 
-Unit/API tests use Node’s built-in test runner. They cover questionnaire validation, pathway differences, all 300 supported profile combinations, source metadata, server-side paywall checks, administrator authentication and access rules, JSON access-store behavior, real-input AI context construction, bounded conversation history, missing configuration, provider failures, timeout behavior and request limits. Provider calls are replaced with injected test clients or offline SDK transport: these tests do not send requests to OpenAI or require a key.
+Unit/API tests use Node’s built-in test runner. They cover questionnaire validation, pathway differences, all 300 supported profile combinations, source metadata, server-side paywall checks, administrator authentication and access rules, persistent access/quota behavior, identity admission and retention, production configuration, real-input AI context construction, bounded conversation history, missing configuration, provider failures, timeout behavior and request limits. Provider calls are replaced with injected test clients or offline SDK transport: these tests do not send requests to OpenAI or require a key.
 
 The Playwright browser suite uses installed **Microsoft Edge** on Windows and an isolated production server on port **3002**. It checks user flows, persistence, paywall behavior, administrator controls and responsive layouts without paid provider calls. Close any other process occupying that test port before running it. Browser output is ignored by Git.
 
@@ -169,10 +179,12 @@ server/app.js         Node API, anonymous demo sessions, limits and OpenAI SDK
 server/index.js       Environment loading and server startup
 server/admin.js       Administrator password hashing and verification
 server/access-store.js Durable manual-access metadata and demo settings
+server/usage-store.js Durable daily AI allowance and attempt reservations
 scripts/setup-admin.mjs Safe local administrator setup
 server/.env.example  Safe local configuration template
 tests/                Unit/API and browser tests
 docs/sources.md       Requirements verification and update notes
 docs/admin.md         Administrator workflow and hosting storage
+docs/render.md        Production settings and persistent-disk deployment
 vite.config.js        React build and development API proxy
 ```

@@ -1,5 +1,6 @@
 import { defineConfig } from '@playwright/test';
 import { hashAdminPassword } from './server/admin.js';
+import path from 'node:path';
 
 const testAdminHash = await hashAdminPassword('playwright-admin-only-password-2026');
 
@@ -26,6 +27,9 @@ export default defineConfig({
       PORT: '3002', APP_ORIGIN: 'http://127.0.0.1:3002', OPENAI_API_KEY: '',
       ADMIN_PASSWORD_HASH: testAdminHash, SESSION_SECRET: 'teachforward-playwright-stable-secret',
       ACCESS_DATA_FILE: 'tests/artifacts/e2e-access.json',
+      USAGE_DATA_FILE: 'tests/artifacts/e2e-usage.json',
+      DATA_DIRECTORY: path.resolve('tests/artifacts/e2e-data'), RENDER: 'false',
+      ACCESS_ID_IP_BURST_LIMIT: '200', ACCESS_ID_IP_DAILY_LIMIT: '500',
     },
   },
 });

@@ -7,6 +7,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { buildRoadmap, validateProfile } from '../shared/roadmap.js';
 import { createAccessStore } from './access-store.js';
+import { createUsageStore } from './usage-store.js';
 import { validAdminHash, verifyAdminPassword } from './admin.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -52,19 +53,8 @@ function fail(res, status, code, error, extra = {}) {
   return res.status(status).json({ error, code, ...extra });
 }
 
-function usageFor(session, now) {
-  const day = new Date(now).toISOString().slice(0, 10);
-  if (session.day !== day) {
-    session.day = day;
-    session.used = 0;
-  }
-  const limit = LIMITS[session.plan];
-  return {
-    used: session.used,
-    limit,
-    remaining: Math.max(0, limit - session.used),
-    resetsAt: new Date(`${day}T00:00:00.000Z`).getTime() + DAY,
-  };
+function usageFor(session, now, usageStore) {
+  return usageStore.usage(session.identityHash, LIMITS[session.plan], now);
 }
 
 /** Inject the OpenAI client/clock in tests; never make remote API calls in tests. */
@@ -83,6 +73,7 @@ export function createApp(options = {}) {
   const rateLimit = options.rateLimit ?? 10;
   const configuredOrigin = options.appOrigin ?? process.env.APP_ORIGIN;
   const accessStore = options.accessStore ?? createAccessStore();
+  const usageStore = options.usageStore ?? createUsageStore();
   const adminPasswordHash = options.adminPasswordHash ?? process.env.ADMIN_PASSWORD_HASH;
   const adminConfigured = validAdminHash(adminPasswordHash);
   const adminSessions = new Map();
@@ -110,7 +101,8 @@ export function createApp(options = {}) {
       const origin = req.get('origin');
       const sameOrigin = origin === `${req.protocol}://${req.get('host')}`;
       const devOrigin = !production && /^http:\/\/(localhost|127\.0\.0\.1):5173$/.test(origin ?? '');
-      if (req.get('sec-fetch-site') === 'cross-site' || (origin && !sameOrigin && !devOrigin && origin !== configuredOrigin)) {
+      const originAllowed = production && configuredOrigin ? origin === configuredOrigin : sameOrigin || devOrigin || origin === configuredOrigin;
+      if (req.get('sec-fetch-site') === 'cross-site' || (origin && !originAllowed)) {
         return fail(res, 403, 'ORIGIN_REJECTED', 'This request must come from the TeachForward app.');
       }
       if (!req.is('application/json')) {
@@ -140,10 +132,20 @@ export function createApp(options = {}) {
     if (!session) {
       if (sessions.size >= maxSessions) sessions.delete(sessions.keys().next().value);
       id ??= randomBytes(24).toString('hex');
-      session = { plan: 'basic', demo: false, used: 0, day: '', expiresAt: time + SESSION_TTL };
+      session = { plan: 'basic', demo: false, expiresAt: time + SESSION_TTL };
       sessions.set(id, session);
     }
-    const visitor = accessStore.identity(id, time);
+    let visitor;
+    try {
+      visitor = accessStore.identity(id, time, { ipHash: createHmac('sha256', sessionSecret).update(`ip:${req.ip ?? 'unknown'}`).digest('hex') });
+    } catch (error) {
+      const retryAfter = Number.isFinite(error.retryAfter) ? Math.max(1, Math.ceil(error.retryAfter)) : 300;
+      res.setHeader('Retry-After', retryAfter);
+      if (error.code === 'ACCESS_CREATION_RATE_LIMIT') return fail(res, 429, error.code, 'Too many new visitor identities. Wait before trying again.', { retryAfter });
+      if (error.code === 'ACCESS_STORAGE_FULL') return fail(res, 503, error.code, 'New visitor access is temporarily at capacity. Existing roadmaps in your browser remain available. Please try later.', { retryAfter });
+      return fail(res, 503, 'ACCESS_STORAGE_UNAVAILABLE', 'Visitor access storage is temporarily unavailable. Your saved roadmap remains in this browser.', { retryAfter });
+    }
+    session.identityHash = visitor.identityHash;
     session.accessId = visitor.accessId;
     session.entitlement = entitlementFor(visitor, session, time);
     session.plan = session.entitlement.source === 'free' ? 'basic' : 'plus';
@@ -167,7 +169,7 @@ export function createApp(options = {}) {
       accessId: session.accessId, entitlement: session.entitlement,
       demoAvailable: accessStore.settings().demoUpgradeEnabled,
       aiConfigured: Boolean(client), model,
-      usage: usageFor(session, now()), sessionExpiresAt: session.expiresAt,
+      usage: usageFor(session, now(), usageStore), sessionExpiresAt: session.expiresAt,
     };
   };
 
@@ -193,11 +195,10 @@ export function createApp(options = {}) {
     const visitors = accessStore.list().map(visitor => {
       const activeSession = [...sessions.values()].find(session => session.accessId === visitor.accessId && session.expiresAt > time && session.demo);
       const entitlement = entitlementFor(visitor, activeSession, time);
-      const matchingSession = activeSession ?? [...sessions.values()].find(session => session.accessId === visitor.accessId && session.expiresAt > time);
       return {
         accessId: visitor.accessId, createdAt: visitor.createdAt, lastSeenAt: visitor.lastSeenAt,
         plan: entitlement.source === 'free' ? 'basic' : 'plus', source: entitlement.source, expiresAt: entitlement.expiresAt,
-        used: matchingSession ? usageFor(matchingSession, time).used : 0,
+        used: usageStore.usage(visitor.identityHash, entitlement.source === 'free' ? LIMITS.basic : LIMITS.plus, time).used,
         limit: entitlement.source === 'free' ? LIMITS.basic : LIMITS.plus,
       };
     }).sort((left, right) => right.lastSeenAt - left.lastSeenAt);
@@ -336,18 +337,41 @@ export function createApp(options = {}) {
       return fail(res, 503, 'AI_NOT_CONFIGURED', 'AI Mentor is not connected yet. The project owner must add an OpenAI API key to the server’s local .env file. Your roadmap and saved progress still work.');
     }
     const session = req.demoSession;
-    const usage = usageFor(session, now());
+    const usage = usageFor(session, now(), usageStore);
     if (!usage.remaining) {
-      return fail(res, 429, 'DAILY_LIMIT', `Your ${session.plan === 'plus' ? 'Plus demo' : 'Basic'} mentor allowance has been used for today.`, { usage });
+      const retryAfter = Math.max(1, Math.ceil((usage.resetsAt - now()) / 1000));
+      res.setHeader('Retry-After', retryAfter);
+      return fail(res, 429, 'DAILY_LIMIT', `Your ${session.plan === 'plus' ? 'Plus' : 'Basic'} mentor allowance has been used for today.`, { usage, retryAfter });
     }
     if (session.inFlight) return fail(res, 429, 'REQUEST_IN_PROGRESS', 'Your previous mentor request is still running.');
+    let reservation;
+    try {
+      reservation = usageStore.reserve({
+        identityHash: session.identityHash,
+        ipHash: createHmac('sha256', sessionSecret).update(`ip:${req.ip ?? 'unknown'}`).digest('hex'),
+        limit: LIMITS[session.plan], now: now(), attemptSlots: 1 + maxRetries,
+      });
+    } catch (error) {
+      if (['VISITOR_DAILY_LIMIT', 'IP_DAILY_LIMIT', 'GLOBAL_DAILY_LIMIT'].includes(error.code)) {
+        const code = error.code === 'VISITOR_DAILY_LIMIT' ? 'DAILY_LIMIT' : error.code === 'IP_DAILY_LIMIT' ? 'AI_IP_DAILY_LIMIT' : 'AI_GLOBAL_DAILY_LIMIT';
+        const retryAfter = Math.max(1, Math.ceil((usage.resetsAt - now()) / 1000));
+        res.setHeader('Retry-After', retryAfter);
+        const message = code === 'AI_GLOBAL_DAILY_LIMIT' ? 'AI Mentor has reached the shared daily service limit. Please try after the next UTC day begins. Your roadmap still works.' : code === 'AI_IP_DAILY_LIMIT' ? 'AI Mentor has reached the daily limit for this network. Please try after the next UTC day begins. Your roadmap still works.' : 'Your daily Mentor allowance has been used.';
+        return fail(res, 429, code, message, { usage, retryAfter });
+      }
+      return fail(res, 503, 'USAGE_STORAGE_UNAVAILABLE', 'AI usage could not be recorded safely. No AI request was sent. Your roadmap remains available.');
+    }
+    const settle = success => {
+      try { usageStore.finish(reservation, { success }); return true; }
+      catch { return false; }
+    };
     session.inFlight = true;
     const previousConversation = session.conversation;
     const history = previousConversation?.id === conversationId && previousConversation.profileKey === roadmap.id
       ? previousConversation.exchanges
       : [];
-    // Reserve an allowance slot before the request to prevent simultaneous overspending.
-    session.used++;
+    // Reservation is durable before contacting OpenAI. Global/IP potential
+    // attempt slots are never refunded, even on timeout, retries or restart.
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     const completedSet = new Set(completed);
@@ -384,17 +408,18 @@ export function createApp(options = {}) {
       const rawAnswer = typeof response.output_text === 'string' ? response.output_text.trim() : '';
       const answer = sourceSafeAnswer(rawAnswer);
       if (!answer || rawAnswer.length > ANSWER_CHARACTERS || answer.length > ANSWER_CHARACTERS || response.status === 'incomplete' || response.error) {
-        session.used = Math.max(0, session.used - 1);
+        if (!settle(false)) return fail(res, 503, 'USAGE_STORAGE_UNAVAILABLE', 'AI usage could not be finalized safely. Your allowance may remain reserved until its daily reset. Your roadmap still works.');
         return fail(res, 502, 'AI_EMPTY_RESPONSE', 'The mentor could not finish a useful answer. Please try again. Your daily allowance was not reduced.');
       }
+      if (!settle(true)) return fail(res, 503, 'USAGE_STORAGE_UNAVAILABLE', 'AI usage could not be finalized safely. Your allowance may remain reserved until its daily reset. Your roadmap still works.');
       session.conversation = {
         id: conversationId,
         profileKey: roadmap.id,
         exchanges: boundedHistory([...history, { question: message.trim(), answer }]),
       };
-      res.json({ answer, sources: roadmap.sources, remaining: usageFor(session, now()).remaining, usage: usageFor(session, now()) });
+      res.json({ answer, sources: roadmap.sources, remaining: usageFor(session, now(), usageStore).remaining, usage: usageFor(session, now(), usageStore) });
     } catch (error) {
-      session.used = Math.max(0, session.used - 1);
+      if (!settle(false)) return fail(res, 503, 'USAGE_STORAGE_UNAVAILABLE', 'AI usage could not be finalized safely. Your allowance may remain reserved until its daily reset. Your roadmap still works.');
       if (error?.status === 401) {
         return fail(res, 502, 'AI_AUTHENTICATION', 'OpenAI did not accept the server API key. The project owner needs to replace it in the server configuration and restart the server. Your roadmap and saved progress still work, and your daily allowance was not reduced.');
       }
