@@ -1,0 +1,27 @@
+node_modules/
+dist/
+.env
+.env.*
+**/.env
+**/.env.*
+!.env.example
+!**/.env.example
+playwright-report/
+test-results/
+tests/artifacts/
+server/data/
+server/admin-access.txt
+# Private administrator credential copies and backups.
+server/admin-access*
+*.log
+*.log.*
+# Local private-key and credential containers.
+*.key
+*.pem
+*.p12
+*.pfx
+*.p8
+*.jks
+.DS_Store
+Thumbs.db
+.vscode/
