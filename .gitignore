@@ -25,3 +25,5 @@ server/admin-access*
 .DS_Store
 Thumbs.db
 .vscode/
+# Private Render environment import; never commit this file.
+.env.render.local

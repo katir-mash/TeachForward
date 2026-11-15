@@ -21,31 +21,45 @@ export function loadServerConfig(env = process.env, args = process.argv) {
   const port = integer(env, 'PORT', 3001, 65535);
   let appOrigin;
   let loopback = true;
-  if (env.APP_ORIGIN?.trim()) {
+  const origin = env.APP_ORIGIN?.trim() || env.RENDER_EXTERNAL_URL?.trim();
+  if (origin) {
     let url;
-    try { url = new URL(env.APP_ORIGIN.trim()); } catch { throw configError('APP_ORIGIN must be an absolute site origin.'); }
+    try { url = new URL(origin); } catch { throw configError('APP_ORIGIN or RENDER_EXTERNAL_URL must be an absolute site origin.'); }
     loopback = ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname);
     if (url.username || url.password || url.search || url.hash || url.pathname !== '/' || !['http:', 'https:'].includes(url.protocol)) throw configError('APP_ORIGIN must contain only the site protocol, host and optional port.');
     if (url.protocol !== 'https:' && !loopback) throw configError('APP_ORIGIN must use HTTPS for a public site.');
     appOrigin = url.origin;
   }
-  if (production && !appOrigin) throw configError('APP_ORIGIN is required in production. Use a loopback origin only for a local production preview.');
+  if (production && !appOrigin) throw configError('APP_ORIGIN or RENDER_EXTERNAL_URL is required in production. Use a loopback origin only for a local production preview.');
   const render = env.RENDER === 'true';
   if (render && (!production || !appOrigin?.startsWith('https:') || loopback)) throw configError('Render requires production mode and a public HTTPS APP_ORIGIN.');
   const publicDeployment = production && !loopback;
   if ((production || env.OPENAI_API_KEY?.trim() || env.ADMIN_PASSWORD_HASH) && (!env.SESSION_SECRET?.trim() || env.SESSION_SECRET.trim().length < 32)) throw configError('A stable SESSION_SECRET of at least 32 characters is required for production, AI or administrator access.');
-  if (publicDeployment && (!env.DATA_DIRECTORY || !path.isAbsolute(env.DATA_DIRECTORY))) throw configError('Set DATA_DIRECTORY to the absolute persistent-disk mount directory.');
-  if (publicDeployment && env.PERSISTENT_STORAGE_CONFIRMED !== '1') throw configError('Attach a persistent disk, then set PERSISTENT_STORAGE_CONFIRMED to acknowledge that requirement.');
-  const dataDirectory = path.resolve(env.DATA_DIRECTORY || path.join(ROOT, 'server', 'data'));
-  if (!within(ROOT, dataDirectory)) throw configError('DATA_DIRECTORY must be a directory inside the project.');
-  const accessFile = path.resolve(env.ACCESS_DATA_FILE || path.join(dataDirectory, 'access.json'));
-  const usageFile = path.resolve(env.USAGE_DATA_FILE || path.join(dataDirectory, 'usage.json'));
-  for (const file of [accessFile, usageFile]) {
-    if (!within(ROOT, file) || (publicDeployment && !within(dataDirectory, file))) throw configError('Access and usage files must remain inside the configured persistent project directory.');
+  const redisUrl = env.UPSTASH_REDIS_REST_URL?.trim();
+  const redisToken = env.UPSTASH_REDIS_REST_TOKEN?.trim();
+  if ((production || redisUrl || redisToken) && (!redisUrl || !redisToken)) throw configError('UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN are required together; production requires Redis.');
+  if (redisUrl) {
+    let url;
+    try { url = new URL(redisUrl); } catch { throw configError('UPSTASH_REDIS_REST_URL must be a valid HTTPS REST origin.'); }
+    if (url.protocol !== 'https:' || url.username || url.password || url.search || url.hash || url.pathname !== '/') throw configError('UPSTASH_REDIS_REST_URL must contain only an HTTPS REST origin.');
+    if (redisToken.length > 8192 || /\s|[\u0000-\u001f\u007f]/.test(redisToken)) throw configError('UPSTASH_REDIS_REST_TOKEN is not a supported REST token.');
   }
-  if (accessFile === usageFile) throw configError('ACCESS_DATA_FILE and USAGE_DATA_FILE must be different files.');
+  const storage = redisUrl ? 'redis' : 'file';
+  let dataDirectory;
+  let accessFile;
+  let usageFile;
+  // Local files are a development convenience only; public and local production
+  // both require Redis. Legacy disk acknowledgement cannot bypass that check.
+  if (storage === 'file') {
+    dataDirectory = path.resolve(env.DATA_DIRECTORY || path.join(ROOT, 'server', 'data'));
+    if (!within(ROOT, dataDirectory)) throw configError('DATA_DIRECTORY must be a directory inside the project.');
+    accessFile = path.resolve(env.ACCESS_DATA_FILE || path.join(dataDirectory, 'access.json'));
+    usageFile = path.resolve(env.USAGE_DATA_FILE || path.join(dataDirectory, 'usage.json'));
+    if (![accessFile, usageFile].every(file => within(ROOT, file))) throw configError('Access and usage files must remain inside the development project directory.');
+    if (accessFile === usageFile) throw configError('ACCESS_DATA_FILE and USAGE_DATA_FILE must be different files.');
+  }
   return {
-    production, publicDeployment, port, appOrigin, dataDirectory, accessFile, usageFile,
+    production, publicDeployment, port, appOrigin, storage, redisUrl, redisToken, dataDirectory, accessFile, usageFile,
     accessOptions: {
       maxVisitors: integer(env, 'ACCESS_ID_MAX_RECORDS', 10_000, 10_000),
       inactiveTtlMs: integer(env, 'ACCESS_ID_IDLE_DAYS', 30, 365) * 86_400_000,

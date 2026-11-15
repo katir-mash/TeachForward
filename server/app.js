@@ -74,6 +74,7 @@ export function createApp(options = {}) {
   const configuredOrigin = options.appOrigin ?? process.env.APP_ORIGIN;
   const accessStore = options.accessStore ?? createAccessStore();
   const usageStore = options.usageStore ?? createUsageStore();
+  const limiterStore = options.limiterStore;
   const adminPasswordHash = options.adminPasswordHash ?? process.env.ADMIN_PASSWORD_HASH;
   const adminConfigured = validAdminHash(adminPasswordHash);
   const adminSessions = new Map();
@@ -114,6 +115,7 @@ export function createApp(options = {}) {
   app.use(express.json({ limit: '16kb', strict: true }));
 
   const sign = (id) => createHmac('sha256', sessionSecret).update(id).digest('base64url');
+  const networkHash = req => createHmac('sha256', sessionSecret).update(`ip:${req.ip ?? 'unknown'}`).digest('hex');
   const verifiedId = (cookieHeader) => {
     const raw = (cookieHeader ?? '').split(';').map((part) => part.trim()).find((part) => part.startsWith(`${COOKIE}=`))?.slice(COOKIE.length + 1);
     if (!raw || raw.length > 150) return null;
@@ -124,7 +126,7 @@ export function createApp(options = {}) {
     return expected.length === received.length && timingSafeEqual(expected, received) ? id : null;
   };
 
-  const withSession = (req, res, next) => {
+  const withSession = async (req, res, next) => {
     const time = now();
     for (const [id, session] of sessions) if (session.expiresAt <= time) sessions.delete(id);
     let id = verifiedId(req.get('cookie'));
@@ -137,7 +139,8 @@ export function createApp(options = {}) {
     }
     let visitor;
     try {
-      visitor = accessStore.identity(id, time, { ipHash: createHmac('sha256', sessionSecret).update(`ip:${req.ip ?? 'unknown'}`).digest('hex') });
+      visitor = await accessStore.identity(id, time, { ipHash: networkHash(req) });
+      session.entitlement = entitlementFor(visitor, session, time, await accessStore.settings());
     } catch (error) {
       const retryAfter = Number.isFinite(error.retryAfter) ? Math.max(1, Math.ceil(error.retryAfter)) : 300;
       res.setHeader('Retry-After', retryAfter);
@@ -147,7 +150,6 @@ export function createApp(options = {}) {
     }
     session.identityHash = visitor.identityHash;
     session.accessId = visitor.accessId;
-    session.entitlement = entitlementFor(visitor, session, time);
     session.plan = session.entitlement.source === 'free' ? 'basic' : 'plus';
     const secure = req.secure || configuredOrigin?.startsWith('https://');
     res.setHeader('Set-Cookie', `${COOKIE}=${id}.${sign(id)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${IDENTITY_TTL / 1000}${secure ? '; Secure' : ''}`);
@@ -155,21 +157,23 @@ export function createApp(options = {}) {
     next();
   };
 
-  function entitlementFor(visitor, session, time) {
-    if (visitor.manualExpiresAt > time) return { source: 'admin', expiresAt: visitor.manualExpiresAt };
-    if (accessStore.settings().demoUpgradeEnabled && session?.demo) return { source: 'demo', expiresAt: session.expiresAt };
+  function entitlementFor(visitor, session, time, settings) {
+    if (visitor?.manualExpiresAt > time) return { source: 'admin', expiresAt: visitor.manualExpiresAt };
+    const demoExpiresAt = accessStore.setDemo ? (visitor?.demoExpiresAt ?? 0) : (session?.demo ? session.expiresAt : 0);
+    if (settings.demoUpgradeEnabled && demoExpiresAt > time) return { source: 'demo', expiresAt: demoExpiresAt };
     return { source: 'free', expiresAt: null };
   }
-  const publicSession = (session) => {
-    const visitor = accessStore.getByAccessId(session.accessId);
-    session.entitlement = entitlementFor(visitor, session, now());
+  const publicSession = async (session) => {
+    const visitor = await accessStore.getByAccessId(session.accessId);
+    const settings = await accessStore.settings();
+    session.entitlement = entitlementFor(visitor, session, now(), settings);
     session.plan = session.entitlement.source === 'free' ? 'basic' : 'plus';
     return {
       plan: session.plan, demo: session.entitlement.source === 'demo',
       accessId: session.accessId, entitlement: session.entitlement,
-      demoAvailable: accessStore.settings().demoUpgradeEnabled,
+      demoAvailable: settings.demoUpgradeEnabled,
       aiConfigured: Boolean(client), model,
-      usage: usageFor(session, now(), usageStore), sessionExpiresAt: session.expiresAt,
+      usage: await usageFor(session, now(), usageStore), sessionExpiresAt: session.expiresAt,
     };
   };
 
@@ -190,30 +194,37 @@ export function createApp(options = {}) {
     if (!adminSession(req)) return fail(res, 401, 'ADMIN_REQUIRED', 'Sign in to the administrator panel to continue.');
     next();
   };
-  function overview() {
+  async function overview() {
     const time = now();
-    const visitors = accessStore.list().map(visitor => {
+    const settings = await accessStore.settings();
+    const records = await accessStore.list();
+    const visitors = records.map(visitor => {
       const activeSession = [...sessions.values()].find(session => session.accessId === visitor.accessId && session.expiresAt > time && session.demo);
-      const entitlement = entitlementFor(visitor, activeSession, time);
+      const entitlement = entitlementFor(visitor, activeSession, time, settings);
       return {
         accessId: visitor.accessId, createdAt: visitor.createdAt, lastSeenAt: visitor.lastSeenAt,
         plan: entitlement.source === 'free' ? 'basic' : 'plus', source: entitlement.source, expiresAt: entitlement.expiresAt,
-        used: usageStore.usage(visitor.identityHash, entitlement.source === 'free' ? LIMITS.basic : LIMITS.plus, time).used,
         limit: entitlement.source === 'free' ? LIMITS.basic : LIMITS.plus,
       };
-    }).sort((left, right) => right.lastSeenAt - left.lastSeenAt);
+    });
+    const entries = records.map((visitor, index) => ({ identityHash: visitor.identityHash, limit: visitors[index].limit }));
+    const usages = usageStore.usageMany
+      ? await usageStore.usageMany(entries, time)
+      : await Promise.all(entries.map(({ identityHash, limit }) => usageStore.usage(identityHash, limit, time)));
+    visitors.forEach((visitor, index) => { visitor.used = usages[index].used; });
+    visitors.sort((left, right) => right.lastSeenAt - left.lastSeenAt);
     return {
       visitors,
       stats: { visitors: visitors.length, manualPlus: visitors.filter(item => item.source === 'admin').length, demoPlus: visitors.filter(item => item.source === 'demo').length },
-      settings: accessStore.settings(),
+      settings,
     };
   }
-  function storageAction(res, action) {
-    try { action(); return res.json(overview()); }
+  async function storageAction(res, action) {
+    try { await action(); return res.json(await overview()); }
     catch (error) {
       if (error.code === 'ACCESS_NOT_FOUND') return fail(res, 404, 'ACCESS_NOT_FOUND', 'No visitor has this Access ID. Ask them to open their roadmap first.');
       if (error.code === 'INVALID_GRANT' || error.code === 'INVALID_SETTINGS') return fail(res, 400, error.code, error.message);
-      return fail(res, 503, 'ACCESS_STORAGE_UNAVAILABLE', 'Access storage is unavailable. No change was saved.');
+      return fail(res, 503, 'ACCESS_STORAGE_UNAVAILABLE', 'Access storage is unavailable. The result could not be confirmed. Refresh after storage recovers.');
     }
   }
 
@@ -223,19 +234,25 @@ export function createApp(options = {}) {
     const password = req.body?.password;
     if (typeof password !== 'string' || !password || password.length > 256) return fail(res, 400, 'INVALID_PASSWORD', 'Enter an administrator password of at most 256 characters.');
     const time = now();
-    for (const [ip, attempt] of adminAttempts) if (attempt.resetAt <= time) adminAttempts.delete(ip);
-    const ip = req.ip ?? 'unknown';
-    let attempt = adminAttempts.get(ip);
-    if (!attempt) {
-      if (adminAttempts.size >= maxSessions) adminAttempts.delete(adminAttempts.keys().next().value);
-      attempt = { count: 0, resetAt: time + adminLoginWindow }; adminAttempts.set(ip, attempt);
+    let throttle;
+    if (limiterStore) {
+      throttle = await limiterStore.hit({ scope: 'admin-login', ipHash: networkHash(req), limit: adminLoginLimit, windowMs: adminLoginWindow, now: time });
+    } else {
+      for (const [ip, attempt] of adminAttempts) if (attempt.resetAt <= time) adminAttempts.delete(ip);
+      const ip = req.ip ?? 'unknown';
+      let attempt = adminAttempts.get(ip);
+      if (!attempt) {
+        if (adminAttempts.size >= maxSessions) adminAttempts.delete(adminAttempts.keys().next().value);
+        attempt = { count: 0, resetAt: time + adminLoginWindow }; adminAttempts.set(ip, attempt);
+      }
+      throttle = { allowed: attempt.count < adminLoginLimit, retryAfter: Math.max(1, Math.ceil((attempt.resetAt - time) / 1000)) };
+      if (throttle.allowed) attempt.count++;
     }
-    if (attempt.count >= adminLoginLimit) {
-      const retryAfter = Math.max(1, Math.ceil((attempt.resetAt - time) / 1000));
+    if (!throttle.allowed) {
+      const retryAfter = throttle.retryAfter;
       res.setHeader('Retry-After', retryAfter);
       return fail(res, 429, 'ADMIN_RATE_LIMITED', 'Too many sign-in attempts. Wait 15 minutes before trying again.', { retryAfter });
     }
-    attempt.count++;
     if (adminLoginInFlight) return fail(res, 429, 'ADMIN_LOGIN_BUSY', 'A sign-in check is already running. Please wait a moment.');
     adminLoginInFlight = true;
     try {
@@ -256,7 +273,7 @@ export function createApp(options = {}) {
     res.setHeader('Set-Cookie', `${ADMIN_COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0${secure ? '; Secure' : ''}`);
     res.json({ configured: adminConfigured, authenticated: false });
   });
-  app.get('/api/admin/overview', requireAdmin, (_req, res) => res.json(overview()));
+  app.get('/api/admin/overview', requireAdmin, async (_req, res) => res.json(await overview()));
   app.post('/api/admin/grant', requireAdmin, (req, res) => {
     if (typeof req.body?.accessId !== 'string' || !Number.isInteger(req.body?.days)) return fail(res, 400, 'INVALID_GRANT', 'Enter an Access ID and a whole number of days from 1 to 365.');
     return storageAction(res, () => accessStore.grant(req.body.accessId.trim().toUpperCase(), req.body.days, now()));
@@ -264,23 +281,25 @@ export function createApp(options = {}) {
   app.post('/api/admin/revoke', requireAdmin, (req, res) => {
     if (typeof req.body?.accessId !== 'string') return fail(res, 400, 'INVALID_ACCESS_ID', 'Enter a valid Access ID.');
     const accessId = req.body.accessId.trim().toUpperCase();
-    return storageAction(res, () => {
-      accessStore.revoke(accessId);
+    return storageAction(res, async () => {
+      await accessStore.revoke(accessId);
       for (const session of sessions.values()) if (session.accessId === accessId) session.demo = false;
     });
   });
   app.post('/api/admin/settings', requireAdmin, (req, res) => storageAction(res, () => accessStore.setDemoEnabled(req.body?.demoUpgradeEnabled)));
 
   app.get('/api/health', (_req, res) => res.json({ ok: true, aiConfigured: Boolean(client), model }));
-  app.get('/api/session', withSession, (req, res) => res.json(publicSession(req.demoSession)));
-  app.post('/api/demo-upgrade', withSession, (req, res) => {
-    if (!accessStore.settings().demoUpgradeEnabled) return fail(res, 403, 'DEMO_DISABLED', 'Public Demo upgrade is turned off. Share your Access ID with the administrator to request Plus.');
+  app.get('/api/session', withSession, async (req, res) => res.json(await publicSession(req.demoSession)));
+  app.post('/api/demo-upgrade', withSession, async (req, res) => {
+    if (!(await accessStore.settings()).demoUpgradeEnabled) return fail(res, 403, 'DEMO_DISABLED', 'Public Demo upgrade is turned off. Share your Access ID with the administrator to request Plus.');
+    if (accessStore.setDemo) await accessStore.setDemo(req.demoSession.accessId, true, req.demoSession.expiresAt);
     req.demoSession.demo = true;
-    res.json(publicSession(req.demoSession));
+    res.json(await publicSession(req.demoSession));
   });
-  app.post('/api/demo-reset', withSession, (req, res) => {
+  app.post('/api/demo-reset', withSession, async (req, res) => {
+    if (accessStore.setDemo) await accessStore.setDemo(req.demoSession.accessId, false, null);
     req.demoSession.demo = false;
-    res.json(publicSession(req.demoSession));
+    res.json(await publicSession(req.demoSession));
   });
 
   const checkedRoadmap = (req, res) => {
@@ -298,8 +317,16 @@ export function createApp(options = {}) {
     if (roadmap) res.json({ weeklyPlan: roadmap.weeklyPlan, skillExercises: roadmap.skillExercises });
   });
 
-  const limited = (req, res, next) => {
+  const limited = async (req, res, next) => {
     const time = now();
+    if (limiterStore) {
+      const throttle = await limiterStore.hit({ scope: 'mentor-minute', ipHash: networkHash(req), limit: rateLimit, windowMs: 60_000, now: time });
+      if (!throttle.allowed) {
+        res.setHeader('Retry-After', throttle.retryAfter);
+        return fail(res, 429, 'RATE_LIMITED', 'Too many mentor requests. Please wait a minute and try again.', { retryAfter: throttle.retryAfter });
+      }
+      return next();
+    }
     for (const [ip, record] of ipRequests) if (record.resetAt <= time) ipRequests.delete(ip);
     const ip = req.ip ?? 'unknown';
     let record = ipRequests.get(ip);
@@ -337,21 +364,23 @@ export function createApp(options = {}) {
       return fail(res, 503, 'AI_NOT_CONFIGURED', 'AI Mentor is not connected yet. The project owner must add an OpenAI API key to the server’s local .env file. Your roadmap and saved progress still work.');
     }
     const session = req.demoSession;
-    const usage = usageFor(session, now(), usageStore);
+    const usage = await usageFor(session, now(), usageStore);
     if (!usage.remaining) {
       const retryAfter = Math.max(1, Math.ceil((usage.resetsAt - now()) / 1000));
       res.setHeader('Retry-After', retryAfter);
       return fail(res, 429, 'DAILY_LIMIT', `Your ${session.plan === 'plus' ? 'Plus' : 'Basic'} mentor allowance has been used for today.`, { usage, retryAfter });
     }
     if (session.inFlight) return fail(res, 429, 'REQUEST_IN_PROGRESS', 'Your previous mentor request is still running.');
+    session.inFlight = true;
     let reservation;
     try {
-      reservation = usageStore.reserve({
+      reservation = await usageStore.reserve({
         identityHash: session.identityHash,
         ipHash: createHmac('sha256', sessionSecret).update(`ip:${req.ip ?? 'unknown'}`).digest('hex'),
         limit: LIMITS[session.plan], now: now(), attemptSlots: 1 + maxRetries,
       });
     } catch (error) {
+      session.inFlight = false;
       if (['VISITOR_DAILY_LIMIT', 'IP_DAILY_LIMIT', 'GLOBAL_DAILY_LIMIT'].includes(error.code)) {
         const code = error.code === 'VISITOR_DAILY_LIMIT' ? 'DAILY_LIMIT' : error.code === 'IP_DAILY_LIMIT' ? 'AI_IP_DAILY_LIMIT' : 'AI_GLOBAL_DAILY_LIMIT';
         const retryAfter = Math.max(1, Math.ceil((usage.resetsAt - now()) / 1000));
@@ -361,11 +390,10 @@ export function createApp(options = {}) {
       }
       return fail(res, 503, 'USAGE_STORAGE_UNAVAILABLE', 'AI usage could not be recorded safely. No AI request was sent. Your roadmap remains available.');
     }
-    const settle = success => {
-      try { usageStore.finish(reservation, { success }); return true; }
+    const settle = async success => {
+      try { await usageStore.finish(reservation, { success }); return true; }
       catch { return false; }
     };
-    session.inFlight = true;
     const previousConversation = session.conversation;
     const history = previousConversation?.id === conversationId && previousConversation.profileKey === roadmap.id
       ? previousConversation.exchanges
@@ -408,18 +436,23 @@ export function createApp(options = {}) {
       const rawAnswer = typeof response.output_text === 'string' ? response.output_text.trim() : '';
       const answer = sourceSafeAnswer(rawAnswer);
       if (!answer || rawAnswer.length > ANSWER_CHARACTERS || answer.length > ANSWER_CHARACTERS || response.status === 'incomplete' || response.error) {
-        if (!settle(false)) return fail(res, 503, 'USAGE_STORAGE_UNAVAILABLE', 'AI usage could not be finalized safely. Your allowance may remain reserved until its daily reset. Your roadmap still works.');
+        if (!(await settle(false))) return fail(res, 503, 'USAGE_STORAGE_UNAVAILABLE', 'AI usage could not be finalized safely. Your allowance may remain reserved until its daily reset. Your roadmap still works.');
         return fail(res, 502, 'AI_EMPTY_RESPONSE', 'The mentor could not finish a useful answer. Please try again. Your daily allowance was not reduced.');
       }
-      if (!settle(true)) return fail(res, 503, 'USAGE_STORAGE_UNAVAILABLE', 'AI usage could not be finalized safely. Your allowance may remain reserved until its daily reset. Your roadmap still works.');
+      if (!(await settle(true))) return fail(res, 503, 'USAGE_STORAGE_UNAVAILABLE', 'AI usage could not be finalized safely. Your allowance may remain reserved until its daily reset. Your roadmap still works.');
       session.conversation = {
         id: conversationId,
         profileKey: roadmap.id,
         exchanges: boundedHistory([...history, { question: message.trim(), answer }]),
       };
-      res.json({ answer, sources: roadmap.sources, remaining: usageFor(session, now(), usageStore).remaining, usage: usageFor(session, now(), usageStore) });
+      try {
+        const currentUsage = await usageFor(session, now(), usageStore);
+        res.json({ answer, sources: roadmap.sources, remaining: currentUsage.remaining, usage: currentUsage });
+      } catch {
+        return fail(res, 503, 'USAGE_STORAGE_UNAVAILABLE', 'AI usage could not be confirmed. This question may have used your allowance. Your roadmap still works.');
+      }
     } catch (error) {
-      if (!settle(false)) return fail(res, 503, 'USAGE_STORAGE_UNAVAILABLE', 'AI usage could not be finalized safely. Your allowance may remain reserved until its daily reset. Your roadmap still works.');
+      if (!(await settle(false))) return fail(res, 503, 'USAGE_STORAGE_UNAVAILABLE', 'AI usage could not be finalized safely. Your allowance may remain reserved until its daily reset. Your roadmap still works.');
       if (error?.status === 401) {
         return fail(res, 502, 'AI_AUTHENTICATION', 'OpenAI did not accept the server API key. The project owner needs to replace it in the server configuration and restart the server. Your roadmap and saved progress still work, and your daily allowance was not reduced.');
       }
@@ -440,6 +473,10 @@ export function createApp(options = {}) {
     app.get('/{*path}', (_req, res) => res.sendFile(path.join(distPath, 'index.html')));
   }
   app.use((error, _req, res, _next) => {
+    if (error?.code === 'DEMO_DISABLED') return fail(res, 403, 'DEMO_DISABLED', 'Public Demo upgrade is turned off.');
+    if (['ACCESS_STORAGE_UNAVAILABLE', 'USAGE_STORAGE_UNAVAILABLE', 'SECURITY_STORAGE_UNAVAILABLE'].includes(error?.code)) {
+      return fail(res, 503, error.code, 'Server storage is temporarily unavailable. Access or quota changes could not be confirmed. Your saved roadmap remains in this browser.');
+    }
     if (error?.type === 'entity.too.large') return fail(res, 413, 'BODY_TOO_LARGE', 'This request is too large.');
     if (error instanceof SyntaxError && Object.hasOwn(error, 'body')) return fail(res, 400, 'INVALID_JSON', 'The request body is not valid JSON.');
     return fail(res, 500, 'SERVER_ERROR', 'The server could not complete this request. Please try again.');

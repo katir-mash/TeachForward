@@ -48,6 +48,21 @@ test('grant extension follows its previous expiry and revoke removes entitlement
   assert.equal(store.getByAccessId(accessId).manualExpiresAt, null);
 });
 
+test('development demo entitlement persists, protects active access and is removed on revoke', t => {
+  const filePath = fixture(t);
+  const options = { filePath, inactiveTtlMs: DAY };
+  const first = createAccessStore(options);
+  const visitor = first.identity(PRIVATE_ID, START);
+  first.setDemo(visitor.accessId, true, START + 7 * DAY);
+  const reopened = createAccessStore(options);
+  assert.equal(reopened.getByAccessId(visitor.accessId).demoExpiresAt, START + 7 * DAY);
+  assert.equal(reopened.cleanup(START + 2 * DAY).removed, 0);
+  reopened.setDemoEnabled(false);
+  assert.throws(() => reopened.setDemo(visitor.accessId, true, START + 8 * DAY), error => error.code === 'DEMO_DISABLED');
+  reopened.revoke(visitor.accessId);
+  assert.equal(createAccessStore(options).getByAccessId(visitor.accessId).demoExpiresAt, null);
+});
+
 test('file store persists grants and demo configuration while keeping private cookie out of disk', t => {
   const filePath = fixture(t);
   const first = createAccessStore({ filePath });

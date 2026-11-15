@@ -53,7 +53,7 @@ export function createAccessStore({
       const hashes = new Set();
       if (![1, 2].includes(loaded.version) || typeof loaded.settings?.demoUpgradeEnabled !== 'boolean' || !Array.isArray(loaded.visitors) || loaded.visitors.length > HARD_CAP) throw new Error();
       for (const visitor of loaded.visitors) {
-        if (!/^TF-[A-F0-9]{12}$/.test(visitor.accessId) || !/^[a-f0-9]{64}$/.test(visitor.identityHash) || !Number.isFinite(visitor.createdAt) || visitor.createdAt < 0 || !Number.isFinite(visitor.lastSeenAt) || visitor.lastSeenAt < 0 || !(visitor.manualExpiresAt === null || (Number.isFinite(visitor.manualExpiresAt) && visitor.manualExpiresAt >= 0)) || ids.has(visitor.accessId) || hashes.has(visitor.identityHash)) throw new Error();
+        if (!/^TF-[A-F0-9]{12}$/.test(visitor.accessId) || !/^[a-f0-9]{64}$/.test(visitor.identityHash) || !Number.isFinite(visitor.createdAt) || visitor.createdAt < 0 || !Number.isFinite(visitor.lastSeenAt) || visitor.lastSeenAt < 0 || !(visitor.manualExpiresAt === null || (Number.isFinite(visitor.manualExpiresAt) && visitor.manualExpiresAt >= 0)) || !(visitor.demoExpiresAt == null || (Number.isFinite(visitor.demoExpiresAt) && visitor.demoExpiresAt >= 0)) || ids.has(visitor.accessId) || hashes.has(visitor.identityHash)) throw new Error();
         ids.add(visitor.accessId); hashes.add(visitor.identityHash);
       }
       const creations = loaded.version === 1 ? [] : loaded.admission?.creations;
@@ -61,7 +61,7 @@ export function createAccessStore({
       state = {
         version: 2,
         settings: { demoUpgradeEnabled: loaded.settings.demoUpgradeEnabled },
-        visitors: loaded.visitors.map(({ accessId, identityHash, createdAt, lastSeenAt, manualExpiresAt }) => ({ accessId, identityHash, createdAt, lastSeenAt, manualExpiresAt })),
+        visitors: loaded.visitors.map(({ accessId, identityHash, createdAt, lastSeenAt, manualExpiresAt, demoExpiresAt = null }) => ({ accessId, identityHash, createdAt, lastSeenAt, manualExpiresAt, demoExpiresAt })),
         admission: { creations: creations.map(({ at, ipHash }) => ({ at, ipHash })) },
       };
     } catch {
@@ -91,7 +91,7 @@ export function createAccessStore({
     update(visitor); commit(next); return copy(visitor);
   }
 
-  const retained = (visitor, now) => visitor.manualExpiresAt > now || now - Math.max(visitor.lastSeenAt, visitor.manualExpiresAt ?? 0) < inactiveTtlMs;
+  const retained = (visitor, now) => visitor.manualExpiresAt > now || visitor.demoExpiresAt > now || now - Math.max(visitor.lastSeenAt, visitor.manualExpiresAt ?? 0, visitor.demoExpiresAt ?? 0) < inactiveTtlMs;
 
   function prune(next, now) {
     const beforeVisitors = next.visitors.length;
@@ -155,7 +155,7 @@ export function createAccessStore({
       creationAdmission(next, ipHash, now);
       let accessId;
       do { accessId = `TF-${randomBytes(6).toString('hex').toUpperCase()}`; } while (next.visitors.some(visitor => visitor.accessId === accessId));
-      const visitor = { accessId, identityHash, createdAt: now, lastSeenAt: now, manualExpiresAt: null };
+      const visitor = { accessId, identityHash, createdAt: now, lastSeenAt: now, manualExpiresAt: null, demoExpiresAt: null };
       next.visitors.push(visitor); commit(next); return copy(visitor);
     },
     list: () => copy(state.visitors),
@@ -168,7 +168,12 @@ export function createAccessStore({
         visitor.manualExpiresAt = expiresAt;
       });
     },
-    revoke: accessId => changeVisitor(accessId, visitor => { visitor.manualExpiresAt = null; }),
+    revoke: accessId => changeVisitor(accessId, visitor => { visitor.manualExpiresAt = null; visitor.demoExpiresAt = null; }),
+    setDemo(accessId, enabled, expiresAt) {
+      if (typeof enabled !== 'boolean' || (enabled && (!Number.isFinite(expiresAt) || expiresAt < 0))) throw codedError('INVALID_SETTINGS', 'Demo availability must have a valid expiration.');
+      if (enabled && !state.settings.demoUpgradeEnabled) throw codedError('DEMO_DISABLED', 'Public Demo upgrade is turned off.');
+      return changeVisitor(accessId, visitor => { visitor.demoExpiresAt = enabled ? expiresAt : null; });
+    },
     settings: () => copy(state.settings),
     setDemoEnabled(enabled) {
       if (typeof enabled !== 'boolean') throw codedError('INVALID_SETTINGS', 'Demo availability must be true or false.');

@@ -40,7 +40,7 @@ If a port is already in use, stop the other TeachForward process before starting
 
 **$9.99/month is a proposed price being tested.** There is no payment integration or automatic subscription. The Node API checks Plus access using an anonymous signed browser cookie. The administrator can grant access for a limited number of days or enable the clearly labeled public demo.
 
-Network and service-wide daily AI limits can stop requests before a browser's own allowance is exhausted. These limits and daily browser usage are saved to disk before contacting OpenAI, so restarting the server does not reset them.
+Network and service-wide daily AI limits can stop requests before a browser's own allowance is exhausted. Production saves these limits and browser usage atomically in Upstash Redis before contacting OpenAI, so restarting the server does not reset them. Development without Redis uses local JSON stores.
 
 ## Administrator and manual Plus access
 
@@ -54,7 +54,7 @@ npm.cmd run setup:admin
 
 The command creates a random password in the Git-ignored local file `server/admin-access.txt`, adds a scrypt password hash to `server/.env`, and ensures a stable signing secret exists. These private files are generated locally and are not included in the repository. Setup preserves existing OpenAI and administrator settings, and prints no password or API key. Open the credential file privately in your editor, restart the Node server, then sign in at `/admin`. Never paste the file into chat or commit it.
 
-Use the visitor's displayed Access ID to grant or extend Plus by **1–365 whole days**, with at most **365 days remaining** in total, or revoke access. You can also turn public Demo upgrade on or off. Access is checked on the server; the visitor page refreshes status every 30 seconds while visible and when focused. Manual grants and the demo setting persist in `server/data/access.json`. See [the administrator guide](docs/admin.md) for the workflow, storage, credential handling and hosting requirements.
+Use the visitor's displayed Access ID to grant or extend Plus by **1–365 whole days**, with at most **365 days remaining** in total, or revoke access. You can also turn public Demo upgrade on or off. Access is checked on the server; the visitor page refreshes status every 30 seconds while visible and when focused. Production grants and demo settings persist in Upstash Redis; development can use `server/data/access.json`. See [the administrator guide](docs/admin.md) for the workflow, storage, credential handling and hosting requirements.
 
 ## Connect AI Mentor locally
 
@@ -85,7 +85,7 @@ Do not paste a key into chat, commit it, or put it into a `VITE_` variable. The 
 
 The official OpenAI Node SDK is called only in `server/app.js`, using the Responses API. Requests include the real question and server-generated context, rather than a fabricated fallback. The server enforces a 1,200-character question limit, a 16 KB JSON body limit, a per-IP limit of 10 Mentor attempts per minute and one in-flight request per browser session. Answers are capped at 650 output tokens and 4,000 characters. The API has a 20-second total deadline, including at most one SDK retry for transient errors; `OPENAI_MAX_RETRIES` accepts only `0` or `1`. The frontend has a 25-second timeout.
 
-`server/data/usage.json` records browser allowances and daily provider-attempt reservations. Before an AI request, the server reserves one browser question and `1 + OPENAI_MAX_RETRIES` possible provider attempts. Defaults allow **100 provider-attempt slots per service per UTC day** and **30 per network per UTC day**, configurable with `AI_DAILY_REQUEST_LIMIT` and `AI_IP_DAILY_REQUEST_LIMIT`. Reserved network/service slots are never refunded, including on errors, unused retries or restart. Failed, incomplete or oversized responses refund the browser question only after that refund is saved. An interrupted reservation remains counted conservatively. These are request limits, not a guaranteed dollar spending cap.
+Upstash Redis records production browser allowances and daily provider-attempt reservations; development without Redis uses `server/data/usage.json`. Before an AI request, the server atomically reserves one browser question and `1 + OPENAI_MAX_RETRIES` possible provider attempts. Defaults allow **100 provider-attempt slots per service per UTC day** and **30 per network per UTC day**, configurable with `AI_DAILY_REQUEST_LIMIT` and `AI_IP_DAILY_REQUEST_LIMIT`. Reserved network/service slots are never refunded, including on errors, unused retries or restart. Failed, incomplete or oversized responses refund the browser question only after that refund is saved. An interrupted reservation remains counted conservatively. Redis outages block provider requests rather than falling back to local counters. These are request limits, not a guaranteed dollar spending cap.
 
 The server retains at most three successful question/answer exchanges and 6,000 characters for the current anonymous conversation. It discards oldest complete exchanges to meet both bounds. A new conversation ID or any changed profile answer starts fresh history. The browser does not supply authoritative assistant history, certification facts or source links. Profile, roadmap and progress context are regenerated for every question; the verified dataset takes precedence over earlier chat text. Model-generated URLs are removed, and the interface displays only the reviewed server source links.
 
@@ -97,7 +97,7 @@ The recorded live check used one short real Mentor request through the interface
 
 The public app needs a **Node.js server**. Deploying only the `dist` folder to static hosting will leave AI Mentor and Plus demo unavailable.
 
-From the project folder:
+Every production run requires an owner-configured Upstash Redis database, including a local production preview. Privately set `UPSTASH_REDIS_REST_URL` and `UPSTASH_REDIS_REST_TOKEN` in `server/.env` first; do not paste their values into a shell command or chat. Development with `npm.cmd run dev` can still use local files without Redis. From the project folder:
 
 ```powershell
 npm.cmd ci
@@ -108,22 +108,22 @@ $env:APP_ORIGIN = "http://localhost:3001"
 npm.cmd start
 ```
 
-For this local preview, open **http://localhost:3001**. `setup:admin` preserves an existing configuration and supplies a stable local signing secret when missing; the PowerShell assignment sets the explicit local origin for this process. If using a different `PORT`, match it in `APP_ORIGIN`. Production startup always requires an explicit valid origin and a `SESSION_SECRET` of at least 32 characters, even for a local preview. Local `server/data` files do not establish public-host durability. The production command serves the built React app and `/api` from one Node process; `dist` must exist first. The server reads the host-provided `PORT`, with 3001 as its local default, and binds to `0.0.0.0`.
+For this local preview, open **http://localhost:3001**. `setup:admin` preserves existing administrator configuration and supplies a stable local signing secret when missing; the PowerShell assignment sets the local origin. If using a different `PORT`, match it in `APP_ORIGIN`. Production startup requires a valid origin, a `SESSION_SECRET` of at least 32 characters and valid reachable Redis, even for a local preview. The production command serves the built React app and `/api` from one Node process; `dist` must exist first. The server reads the host-provided `PORT`, with 3001 as its local default, and binds to `0.0.0.0`.
 
-For a public deployment, follow [the Render deployment guide](docs/render.md). It keeps this single-server architecture and requires actual persistent disk storage. No host, disk or paid plan has been connected by this repository.
+For a public deployment, follow [the Render Free and Upstash guide](docs/render.md). It keeps this single-server architecture without a Render persistent disk. No live database, host or paid plan has been connected by this repository. Keep Upstash eviction disabled and check free-tier limits before choosing a plan.
 
 To deploy to a Node web service or your own Node host:
 
 1. Upload or connect the source repository, including `package-lock.json`, `server`, `shared`, `src`, `public` and `index.html`. Exclude `.env`, `server/admin-access.txt`, `server/data/`, `node_modules`, test output and local secrets.
 2. Set the build command to `npm ci --include=dev && npm run build`, and the start command to `npm start`. On a Windows host, use `npm.cmd` in those commands. The explicit `--include=dev` keeps Vite available during the build even when the host sets `NODE_ENV=production`.
-3. Set `NODE_ENV=production` and `APP_ORIGIN` to the exact public HTTPS origin, for example `https://your-teachforward-domain.example`, without credentials, path, query or fragment. Loopback HTTP origins are allowed only for local production previews/tests. Render requires the public HTTPS configuration. The host supplies `PORT`.
+3. Set `NODE_ENV=production`. An explicit `APP_ORIGIN` must be the exact public HTTPS origin, without credentials, path, query or fragment. On Render it can be omitted: the server validates and uses `RENDER_EXTERNAL_URL`. Loopback HTTP is allowed only for local production previews/tests. The host supplies `PORT`.
 4. Set a stable server-only `SESSION_SECRET` of at least 32 characters and `ADMIN_PASSWORD_HASH` in the host’s secret/environment settings. The administrator hash is generated by `npm.cmd run setup:admin`; the password stays private. To enable AI, set `OPENAI_API_KEY`, `OPENAI_MODEL=gpt-6-luna` (or another verified model available to that key), and `OPENAI_MAX_RETRIES=1` there. Do not upload your local `.env`, credential file, or put these settings into frontend build variables. Restart or redeploy the Node service after changing them; local settings do not configure the host.
 5. Set `TRUST_PROXY=1` only if the deployment is behind exactly one known trusted reverse proxy and the host’s forwarding setup requires it. Otherwise leave it unset. This affects client IP limiting and HTTPS handling.
-6. Keep `/api` on the same origin as the frontend, use HTTPS, and configure the host’s health check to **`/api/health`**. It returns readiness and AI configuration status without secrets.
-7. Mount a persistent writable volume inside the project and set `DATA_DIRECTORY` to that absolute directory. Set `PERSISTENT_STORAGE_CONFIRMED=1` only after verifying the physical disk is attached; this flag acknowledges the setup and does not make an ordinary directory persistent. `access.json` and `usage.json` default to that directory. Optional `ACCESS_DATA_FILE` and `USAGE_DATA_FILE` overrides must remain inside it. Public startup rejects missing storage acknowledgement or out-of-directory paths. Back up both files and the stable signing secret; a normal local JSON file is not durable on an ephemeral host.
+6. Keep `/api` on the same origin as the frontend, use HTTPS, and configure the host’s health check to **`/api/health`**. It returns process and AI configuration information without secrets; it does not check current Redis availability or call OpenAI.
+7. Privately configure the owner-selected Upstash database with `UPSTASH_REDIS_REST_URL` and its read/write `UPSTASH_REDIS_REST_TOKEN`. Keep eviction off. Production always uses Redis and never falls back to local files; missing credentials or unavailable storage block startup/provider work. `DATA_DIRECTORY`, `ACCESS_DATA_FILE`, `USAGE_DATA_FILE` and `PERSISTENT_STORAGE_CONFIRMED` are not production settings and should be removed from Render/import files. There is no automatic migration from local JSON records.
 8. After deployment, create a roadmap, refresh after checking a task, sign into `/admin`, grant and revoke access for its Access ID, test the demo setting, and verify the AI available/unavailable state. No publication or paid host has been configured by this project.
 
-The deployment is a single-process MVP. The JSON stores persist manual Plus expiry dates, browser-identity digests, the public demo setting, browser-creation counters, daily AI allowances and provider-attempt reservations. Browser identity uses a signed HttpOnly, SameSite=Lax cookie lasting up to 365 days, renewed on API session use; retaining that cookie, signing secret and access record is necessary to preserve access. Inactive records are eligible for cleanup after 30 days; active manual grants are protected, with retention measured from the later of last seen or recorded grant expiry. Clearing cookies, changing browser or losing the secret breaks the link, with no account-based recovery. Demo status and chat remain in seven-day memory sessions; administrator logins last up to eight hours. These temporary sessions reset on restart. Multiple instances do not share them or coordinate JSON writes. Manual access does not process payments; real billing requires separate implementation.
+The deployment remains a single-process MVP. Redis persists manual/demo Plus expiry dates, browser-identity digests, the public demo setting, browser-creation counters, shared security limits, daily AI allowances and provider-attempt reservations. Browser identity uses a signed HttpOnly, SameSite=Lax cookie lasting up to 365 days, renewed on API session use; retaining that cookie, signing secret and access record preserves the identity link. Inactive records are eligible for cleanup after 30 days; active manual/demo grants are protected, with retention measured from the latest of last seen, recorded manual expiry or recorded demo expiry. Clearing cookies, changing browser or losing the secret breaks the link, with no account recovery. Bounded chat and administrator-login sessions remain temporary and reset on restart. Durable Redis mutations and reservations are atomic across concurrent callers. Manual access does not process payments; real billing requires separate implementation.
 
 ## Data and privacy
 
@@ -132,7 +132,7 @@ The deployment is a single-process MVP. The JSON stores persist manual Plus expi
 - The downloaded JSON contains profile choices, task completion, the weekly plan and source references. It is a personal progress summary, not an official document.
 - Sending a Mentor question sends that question, four profile choices, the generated route, task completion, official source context, and up to three recent successful exchanges to the Node server and then OpenAI. Exercise notes are not sent. The history is stored only in the server's bounded anonymous session memory, up to 6,000 characters, and resets on a new conversation ID, changed profile, cookie loss or server restart. Leaving the roadmap or refreshing creates a new browser conversation ID; earlier history is not reused for that new conversation. Chat is not saved to localStorage.
 - The API requests `store: false`. This is not a promise of zero provider retention; OpenAI’s account terms and data policies still apply. Do not include sensitive personal information in questions.
-- Visitors have no registration or sign-in. The separate administrator page has password authentication and can view Access IDs, access dates, plan status and usage counts, but not profile answers, chat content or API secrets. JSON stores contain access metadata, identity/network digests and quota/admission counters; no raw IP, profile or chat content is stored there. No database service, analytics, payment processor or email service is connected.
+- Visitors have no registration or sign-in. The separate administrator page has password authentication and can view Access IDs, access dates, plan status and usage counts, but not profile answers, chat content or API secrets. Production Redis (or development JSON) stores access metadata, identity/network digests and quota/admission counters; no raw IP, profile or chat content is stored there. The owner must configure Upstash; this repository does not create a live database, analytics, payment processor or email service.
 
 ## Official requirements and source updates
 
@@ -151,6 +151,8 @@ npm.cmd run test:e2e
 ```
 
 Unit/API tests use Node’s built-in test runner. They cover questionnaire validation, pathway differences, all 300 supported profile combinations, source metadata, server-side paywall checks, administrator authentication and access rules, persistent access/quota behavior, identity admission and retention, production configuration, real-input AI context construction, bounded conversation history, missing configuration, provider failures, timeout behavior and request limits. Provider calls are replaced with injected test clients or offline SDK transport: these tests do not send requests to OpenAI or require a key.
+
+Redis tests execute the exact application Lua scripts in an offline Lua interpreter with a Redis-command fixture. Official Upstash SDK tests use mocked HTTP. These checks do not establish live Redis/Upstash compatibility or availability; a real owner-configured database needs a separate deployment check. At startup, unavailable Redis blocks the backend and frontend asset serving. During a runtime outage, an already loaded roadmap and browser-saved progress remain usable.
 
 The Playwright browser suite uses installed **Microsoft Edge** on Windows and an isolated production server on port **3002**. It checks user flows, persistence, paywall behavior, administrator controls and responsive layouts without paid provider calls. Close any other process occupying that test port before running it. Browser output is ignored by Git.
 
@@ -185,6 +187,6 @@ server/.env.example  Safe local configuration template
 tests/                Unit/API and browser tests
 docs/sources.md       Requirements verification and update notes
 docs/admin.md         Administrator workflow and hosting storage
-docs/render.md        Production settings and persistent-disk deployment
+docs/render.md        Render Free and Upstash production settings
 vite.config.js        React build and development API proxy
 ```

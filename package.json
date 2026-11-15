@@ -17,6 +17,7 @@
     "setup:admin": "node scripts/setup-admin.mjs"
   },
   "dependencies": {
+    "@upstash/redis": "^1.41.0",
     "dotenv": "^18.0.10",
     "express": "^5.3.0",
     "helmet": "^8.3.0",
@@ -29,6 +30,7 @@
     "@playwright/test": "^1.65.1",
     "@vitejs/plugin-react": "^6.3.0",
     "concurrently": "^10.0.7",
+    "fengari": "^0.1.5",
     "vite": "^8.3.8"
   }
 }
